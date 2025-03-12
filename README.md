@@ -1,0 +1,1 @@
+antismash_nameconverter -> Spades/Fasta files have Contig name. In antismash the gbk files get named as contigName_region. This script help creates a name mapper. Thus I have contigName_region and file name.
