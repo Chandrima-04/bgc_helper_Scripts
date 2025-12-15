@@ -41,8 +41,21 @@ find /path/to/your/antismash_outputs -type f -name "*.gbk" | sort > maps/gbk_pat
 ```
 
 
+
 Then run the following
 ```
 python extract_bgc_contig_from_gbk.py maps/gbk_paths.txt maps/bgc_to_contig.tsv
 python join_bin_taxonomy.py
+```
+
+
+Bigslice: Convert .db into individual .csv 
+```
+mkdir -p csv
+
+for t in $(sqlite3 result/data.db "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"); do
+  echo "Exporting $t..."
+  sqlite3 -header -csv result/data.db "SELECT * FROM \"$t\";" > "csv/${t}.csv"
+done
+
 ```
