@@ -1,0 +1,408 @@
+---
+output: html_document
+date: "2026-01-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(tibble)
+library(rlang)
+```
+
+```{r}
+# 1.1 Read core tables ----------------------------------------------------
+
+bgc       <- read_csv("bgc_class_dataset_clustering.csv")
+antismash <- read.csv("antismash_names.csv", stringsAsFactors = FALSE)
+metadata  <- read_csv("Metadata_combined.csv")
+
+# 1.2 Add clean node ids and merge with antismash ------------------------
+
+bgc_with_node <- bgc %>%
+mutate(
+node_clean = str_remove(orig_filename, "\\.region.*$")
+)
+
+merged <- bgc_with_node %>%
+left_join(antismash, by = c("node_clean" = "node"))
+
+# 1.3 Long metadata: map Sample_Name / Other_Name -> file ----------------
+
+metadata_long <- metadata %>%
+select(Sample_Name, Other_Name, everything()) %>%
+pivot_longer(
+cols = c(Sample_Name, Other_Name),
+names_to = "name_type",
+values_to = "file"
+) %>%
+filter(!is.na(file), file != "") %>%
+distinct(file, .keep_all = TRUE)
+
+# 1.4 Merge metadata onto BGC table --------------------------------------
+
+df_1 <- merged %>%
+left_join(metadata_long, by = "file")
+
+# 1.5 Split rows with missing vs non-missing cb-broad-desc ---------------
+
+nadf <- df_1 %>% filter(is.na(`cb-broad-desc`))   # rows without broad env
+df   <- df_1 %>% filter(!is.na(`cb-broad-desc`))  # analysis subset
+
+# At this point we assume df has at least:
+
+# - dataset_name
+
+# - subclass_name
+
+# - cb-broad-desc (broad environment descriptor)
+
+```
+```{r}
+# KL(p || q) for probability vectors p, q --------------------------------
+
+kl_div <- function(p, q) {
+idx <- p > 0 & q > 0
+sum(p[idx] * log(p[idx] / q[idx]))
+}
+
+```
+
+
+```{r}
+compute_location_uniqueness <- function(df,
+location_var = "dataset_name",
+subclass_var = "subclass_name",
+pseudocount  = 0.5) {
+loc_sym <- rlang::sym(location_var)
+sub_sym <- rlang::sym(subclass_var)
+
+# 3.1 Count matrix: location × subclass --------------------------------
+
+counts_df <- df %>%
+count(!!loc_sym, !!sub_sym, name = "count")
+
+mat_df <- counts_df %>%
+tidyr::pivot_wider(
+names_from  = !!sub_sym,
+values_from = count,
+values_fill = 0
+)
+
+loc_ids   <- mat_df[[location_var]]
+count_mat <- as.matrix(mat_df[, -1, drop = FALSE])
+rownames(count_mat) <- loc_ids
+
+K   <- ncol(count_mat)
+N_i <- rowSums(count_mat)
+
+# 3.2 Global background θ (smoothed) -----------------------------------
+
+col_tot <- colSums(count_mat) + pseudocount
+theta   <- col_tot / sum(col_tot)
+
+# 3.3 Per-location composition φ_i (smoothed) --------------------------
+
+smoothed <- count_mat + pseudocount
+phi_mat  <- sweep(smoothed, 1, rowSums(smoothed), "/")
+
+# 3.4 Uniqueness effect size: KL(φ_i || θ) -----------------------------
+
+kl_vec <- apply(phi_mat, 1, function(phi) kl_div(phi, theta))
+
+# 3.5 Likelihood-ratio (G) statistic ----------------------------------
+
+G_vec  <- 2 * N_i * kl_vec
+df_chi <- K - 1
+p_vec  <- pchisq(G_vec, df = df_chi, lower.tail = FALSE)
+
+out <- tibble(
+!!location_var := rownames(count_mat),
+total_bgc      = N_i,
+KL_divergence  = kl_vec,
+G_stat         = G_vec,
+df             = df_chi,
+p_value        = p_vec,
+uniqueness_score = -log10(p_vec)
+)
+
+# Attach useful objects as attributes for reuse ------------------------
+
+attr(out, "theta_global")    <- theta
+attr(out, "phi_by_location") <- phi_mat
+attr(out, "count_mat")       <- count_mat
+
+out
+}
+
+```
+
+```{r}
+uniq_dataset <- compute_location_uniqueness(
+df,
+location_var = "dataset_name",
+subclass_var = "subclass_name",
+pseudocount  = 0.5
+)
+
+uniq_dataset %>%
+arrange(desc(KL_divergence)) %>%
+head(10)
+
+```
+
+
+```{r}
+# Frequentist uniqueness per dataset
+
+uniq_dataset <- compute_location_uniqueness(
+df,
+location_var = "dataset_name",
+subclass_var = "subclass_name",
+pseudocount  = 0.5
+)
+
+uniq_dataset %>% arrange(desc(KL_divergence)) %>% head(10)
+
+```
+
+
+
+```{r}
+compute_location_uniqueness_bayes <- function(df,
+location_var   = "dataset_name",
+subclass_var   = "subclass_name",
+pseudocount    = 0.5,
+alpha_strength = 1,   # total prior mass α0
+n_draws        = 2000,
+seed           = 1) {
+set.seed(seed)
+
+# 4.1 Base frequentist uniqueness --------------------------------------
+
+base_res <- compute_location_uniqueness(
+df,
+location_var = location_var,
+subclass_var = subclass_var,
+pseudocount  = pseudocount
+)
+
+# Extract pieces
+
+count_mat <- attr(base_res, "count_mat")
+theta     <- attr(base_res, "theta_global")
+
+loc_ids <- rownames(count_mat)
+K       <- ncol(count_mat)
+N_i     <- rowSums(count_mat)
+
+# 4.2 Dirichlet prior α centered on θ (empirical Bayes) ----------------
+
+alpha0 <- alpha_strength
+eps    <- 1e-12
+alpha  <- pmax(alpha0 * theta, eps)
+
+# 4.3 Posterior parameters α + n_ij ------------------------------------
+
+post_alpha_mat <- sweep(count_mat, 2, alpha, "+")  # locations × subclasses
+post_sum       <- rowSums(post_alpha_mat)
+
+# Posterior mean and variance of φ_ij under Dirichlet ------------------
+
+post_mean <- post_alpha_mat / post_sum
+
+post_var <- post_alpha_mat * (post_sum - post_alpha_mat) /
+(post_sum^2 * (post_sum + 1))
+
+# 4.4 Helper: Draw from Dirichlet --------------------------------------
+
+rdirichlet_mat <- function(n, alpha_vec) {
+m <- matrix(
+rgamma(n * length(alpha_vec), shape = alpha_vec, rate = 1),
+nrow = n, byrow = TRUE
+)
+m / rowSums(m)
+}
+
+n_loc          <- nrow(count_mat)
+subclass_names <- colnames(count_mat)
+
+U_mean <- numeric(n_loc)
+U_lo   <- numeric(n_loc)
+U_hi   <- numeric(n_loc)
+
+phi_lo      <- matrix(NA_real_, nrow = n_loc, ncol = K)
+phi_hi      <- matrix(NA_real_, nrow = n_loc, ncol = K)
+enrich_prob <- matrix(NA_real_, nrow = n_loc, ncol = K)
+
+# 4.5 Posterior sampling per location ----------------------------------
+
+for (i in seq_len(n_loc)) {
+a_i <- post_alpha_mat[i, ]
+# draws_i: n_draws × K
+draws_i <- rdirichlet_mat(n_draws, a_i)
+
+# Uniqueness draws: U_i^(s) = KL(φ_i^(s) || θ)
+U_draws_i <- apply(draws_i, 1, function(phi) kl_div(phi, theta))
+
+U_mean[i] <- mean(U_draws_i)
+U_lo[i]   <- quantile(U_draws_i, 0.025)
+U_hi[i]   <- quantile(U_draws_i, 0.975)
+
+# Subclass credible intervals
+phi_lo[i, ] <- apply(draws_i, 2, quantile, probs = 0.025)
+phi_hi[i, ] <- apply(draws_i, 2, quantile, probs = 0.975)
+
+# Enrichment probability vs global θ_j
+enrich_prob[i, ] <- colMeans(draws_i > rep(theta, each = n_draws))
+
+}
+
+# 4.6 Dataset-level Bayesian uniqueness summary ------------------------
+
+loc_col <- rlang::sym(location_var)
+
+uniq_bayes <- tibble(
+!!loc_col      := loc_ids,
+total_bgc      = N_i,
+KL_divergence  = base_res$KL_divergence,   # empirical KL
+U_post_mean    = U_mean,
+U_post_lo95    = U_lo,
+U_post_hi95    = U_hi
+)
+
+# 4.7 Subclass-level posterior with uncertainty ------------------------
+
+subclass_post_long <- as.data.frame(post_mean)
+colnames(subclass_post_long) <- subclass_names
+subclass_post_long[[location_var]] <- loc_ids
+
+subclass_post_long <- subclass_post_long %>%
+tidyr::pivot_longer(
+cols      = all_of(subclass_names),
+names_to  = "subclass_name",
+values_to = "post_mean"
+) %>%
+mutate(
+post_sd  = as.vector(sqrt(post_var)),
+lo95     = as.vector(phi_lo),
+hi95     = as.vector(phi_hi),
+enrich_prob = as.vector(enrich_prob),
+theta_global = rep(theta, each = n_loc),
+credibly_enriched = enrich_prob > 0.95
+)
+
+list(
+base_uniqueness   = base_res,          # frequentist table
+bayes_uniqueness  = uniq_bayes,        # posterior KL summary
+subclass_posterior = subclass_post_long,
+theta_global      = theta,
+count_matrix      = count_mat
+)
+}
+
+```
+
+
+```{r}
+res_bayes <- compute_location_uniqueness_bayes(
+df,
+location_var   = "dataset_name",
+subclass_var   = "subclass_name",
+pseudocount    = 0.5,
+alpha_strength = 1,     # tweak for more/less shrinkage
+n_draws        = 2000,
+seed           = 1
+)
+
+# Frequentist table
+
+head(res_bayes$base_uniqueness)
+
+# Posterior uniqueness (mean and 95% CI)
+
+head(res_bayes$bayes_uniqueness)
+
+```
+
+
+
+
+```{r}
+res_bayes$subclass_posterior %>%
+filter(dataset_name == "Gowanus", credibly_enriched) %>%
+arrange(desc(enrich_prob)) %>%
+head(20)
+
+```
+
+```{r}
+compute_uniqueness_decomposition <- function(uniq_res) {
+phi_mat <- attr(uniq_res, "phi_by_location")
+theta   <- attr(uniq_res, "theta_global")
+
+# Ensure θ is aligned with columns of φ
+
+theta <- theta[colnames(phi_mat)]
+
+# Contribution matrix: C_ij = φ_ij * log(φ_ij / θ_j)
+
+C_mat <- sweep(
+phi_mat,
+2,
+theta,
+FUN = function(phi, th) {
+ifelse(phi > 0 & th > 0, phi * log(phi / th), 0)
+}
+)
+
+drivers_tbl <- as.data.frame(C_mat) %>%
+rownames_to_column("dataset_name") %>%
+pivot_longer(
+cols      = -dataset_name,
+names_to  = "subclass_name",
+values_to = "KL_contribution"
+) %>%
+group_by(dataset_name) %>%
+mutate(
+total_KL         = sum(KL_contribution),
+rel_contribution = KL_contribution / total_KL
+) %>%
+arrange(desc(KL_contribution), .by_group = TRUE) %>%
+ungroup()
+
+list(
+C_mat   = C_mat,
+drivers = drivers_tbl
+)
+}
+
+```
+
+```{r}
+decomp <- compute_uniqueness_decomposition(uniq_dataset)
+
+C_mat       <- decomp$C_mat
+drivers_tbl <- decomp$drivers
+
+# Top subclass drivers for Gowanus (by absolute KL contribution)
+
+dataset_of_interest <- "Gowanus"
+
+drivers_gowanus <- drivers_tbl %>%
+filter(dataset_name == dataset_of_interest) %>%
+arrange(desc(KL_contribution)) %>%
+head(10)
+
+drivers_gowanus
+
+```
+
+
