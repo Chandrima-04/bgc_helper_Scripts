@@ -1,0 +1,1692 @@
+---
+title: "labmeeting_jan27"
+output: html_document
+date: "2026-01-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(RColorBrewer)
+library(forcats)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(viridis)
+library(tibble)
+library(rstatix)
+library(ggpubr)
+library(vegan)
+library(pheatmap)
+library(uwot)
+library(stringr)
+library(ComplexHeatmap)
+library(colorRamp2)
+library(igraph)
+library(ggraph)
+```
+
+```{r}
+# 1. Read your data
+bgc <- read_csv("bgc_class_dataset_clustering_with_taxonomy.csv")  
+antismash <- read.csv("antismash_names.csv")
+
+bgc_with_node <- bgc %>%
+  mutate(
+    node_clean = str_remove(orig_filename, "\\.region.*$")
+  )
+merged <- bgc_with_node %>%
+  left_join(antismash, by = c("node_clean" = "node"))
+
+metadata <- read_csv("Metadata_combined.csv")
+metadata_long <- metadata %>%
+  select(Sample_Name, Other_Name, everything()) %>%
+  pivot_longer(
+    cols = c(Sample_Name, Other_Name),
+    names_to = "name_type",
+    values_to = "file"
+  ) %>%
+  filter(!is.na(file), file != "") %>%
+  distinct(file, .keep_all = TRUE)
+
+df_1 <- merged %>%
+  left_join(metadata_long, by = "file")
+
+nadf <- df_1 %>% filter(is.na(`cb-broad-desc`))
+
+df <- df_1 %>% 
+  filter(!is.na(`cb-broad-desc`))
+
+df <- df %>%
+  mutate(
+    subclass_name = case_when(
+      subclass_name == "generic" & class_name == "NRP"     ~ "generic_NRP",
+      subclass_name == "generic" & class_name == "Terpene" ~ "generic_Terpene",
+      TRUE ~ subclass_name
+    )
+  )
+```
+```{r}
+
+############################################################
+# CASE  — BUILD ALL SAMPLE × GENUS MATRICES
+############################################################
+
+df_tax <- df %>%
+  filter(!is.na(file), file != "", !is.na(Genus), Genus != "")
+
+# ---------- 1) sample × subclass_name ----------
+comm_genus_df <- df_tax %>%
+  count(file, Genus, name = "abundance") %>%
+  pivot_wider(
+    names_from  = Genus,
+    values_from = abundance,
+    values_fill = 0
+  )
+```
+
+```{r}
+
+############################################################
+# CASE 1 — BUILD ALL SAMPLE × FEATURE MATRICES
+############################################################
+
+df_div <- df %>%
+  filter(!is.na(file), file != "")
+
+# ---------- 1) sample × subclass_name ----------
+comm_subclass_df <- df_div %>%
+  count(file, subclass_name, name = "abundance") %>%
+  pivot_wider(
+    names_from  = subclass_name,
+    values_from = abundance,
+    values_fill = 0
+  )
+
+comm_subclass <- as.matrix(comm_subclass_df[, -1])
+rownames(comm_subclass) <- comm_subclass_df$file
+
+
+# ---------- 2) sample × class_name ----------
+comm_class_df <- df_div %>%
+  count(file, class_name, name = "abundance") %>%
+  pivot_wider(
+    names_from  = class_name,
+    values_from = abundance,
+    values_fill = 0
+  )
+
+comm_class <- as.matrix(comm_class_df[, -1])
+rownames(comm_class) <- comm_class_df$file
+
+
+# ---------- 3) sample × gcf_id ----------
+comm_gcf_df <- df_div %>%
+  count(file, gcf_id, name = "abundance") %>%
+  pivot_wider(
+    names_from  = gcf_id,
+    values_from = abundance,
+    values_fill = 0
+  )
+
+comm_gcf <- as.matrix(comm_gcf_df[, -1])
+rownames(comm_gcf) <- comm_gcf_df$file
+```
+
+```{r}
+############################################################
+# PREP META (samplewise info)
+############################################################
+
+sample_meta <- df_div %>%
+  distinct(
+    file,
+    Dataset,
+    `cb-broad-desc`,
+    `cb-narrow-desc`
+  ) %>%
+  rename(
+    sample       = file,
+    location     = Dataset,
+    broad_env    = `cb-broad-desc`,
+    narrow_env   = `cb-narrow-desc`
+  )
+```
+
+```{r}
+############################################################
+# ALIGN community matrices to sample_meta ordering
+############################################################
+
+# Ensure sample order matches metadata
+common_samples <- Reduce(
+  intersect,
+  list(
+    rownames(comm_subclass),
+    rownames(comm_class),
+    rownames(comm_gcf),
+    sample_meta$sample
+  )
+)
+
+# Filter metadata first
+sample_meta <- sample_meta %>%
+  filter(sample %in% common_samples) %>%
+  arrange(sample)
+
+# Reorder each matrix
+comm_subclass <- comm_subclass[sample_meta$sample, , drop = FALSE]
+comm_class    <- comm_class[sample_meta$sample, , drop = FALSE]
+comm_gcf      <- comm_gcf[sample_meta$sample, , drop = FALSE]
+
+```
+
+```{r}
+class_summary <- df %>%
+  group_by(Dataset, class_name) %>%
+  summarise(count = n(), .groups = "drop")
+
+# 2️⃣ Plot relative % (stacked to 100)
+ggplot(class_summary,
+       aes(x = Dataset, y = count, fill = class_name)) +
+  geom_bar(stat = "identity", position = "fill") +  # <-- fill makes it % of total
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(option = "turbo") +
+  labs(title = "Relative Distribution of BGC chemical classes by location",
+       x = "Location (Dataset)",
+       y = "Percent",
+       fill = "Chemical class") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+
+
+```{r}
+## 1. Subclass counts per Dataset -----------------------------
+
+subclass_summary <- df %>%
+  group_by(Dataset, subclass_name) %>%
+  summarise(count = n(), .groups = "drop")
+
+## 2. Presence/absence (0/1) matrix ---------------------------
+
+subclass_pa <- subclass_summary %>%
+  mutate(present = as.integer(count > 0)) %>%   # 0/1
+  select(Dataset, subclass_name, present)
+
+pa_df <- subclass_pa %>%
+  tidyr::pivot_wider(
+    id_cols     = Dataset,
+    names_from  = subclass_name,
+    values_from = present,
+    values_fill = 0
+  )
+
+mat_pa <- as.matrix(pa_df[, -1, drop = FALSE])
+rownames(mat_pa) <- pa_df$Dataset
+
+## 3. Map subclass_name -> class_name -------------------------
+
+subclass_class_map <- df %>%
+  filter(!is.na(subclass_name), !is.na(class_name)) %>%
+  group_by(subclass_name) %>%
+  summarise(
+    class_name = paste(sort(unique(class_name)), collapse = "; "),
+    .groups = "drop"
+  )
+
+## 4. Build column info in the SAME order as matrix columns ---
+
+col_info <- tibble(subclass_name = colnames(mat_pa)) %>%
+  left_join(subclass_class_map, by = "subclass_name")
+
+## 5. Define desired class order & create factor --------------
+
+class_order <- c("NRP",
+                 "Polyketide",
+                 "RiPP",
+                 "Saccharide",
+                 "Other",
+                 "Unknown")
+
+col_info$class_name_fact <- factor(col_info$class_name,
+                                   levels = class_order)
+
+## 6. Decide final column order (by class, then subclass) -----
+
+ord <- order(col_info$class_name_fact, col_info$subclass_name, na.last = TRUE)
+
+col_order <- col_info$subclass_name[ord]
+mat_pa    <- mat_pa[, col_order, drop = FALSE]
+
+## 7. Build pheatmap-style annotation_col data.frame ----------
+
+annotation_col <- data.frame(
+  class_name = col_info$class_name[ord],
+  row.names  = col_order,
+  stringsAsFactors = FALSE
+)
+
+## 8. Plot pheatmap -------------------------------------------
+
+pheatmap(
+  mat_pa,
+  cluster_rows      = TRUE,
+  cluster_cols      = FALSE,          # keep our manual column order
+  scale             = "none",
+  color             = c("white", "blue"),
+  breaks            = c(-0.5, 0.5, 1.5),
+  legend_breaks     = c(0, 1),
+  legend_labels     = c("Absent", "Present"),
+  annotation_col    = annotation_col,
+  annotation_legend = TRUE,
+  border_color      = NA,
+  fontsize_row      = 6,
+  fontsize_col      = 6,              # smaller column labels
+  main              = "Presence/Absence of BGC Subclasses"
+)
+
+```
+
+
+```{r}
+# First, create the plot
+ggplot(class_summary,
+       aes(x = Dataset, y = count,
+           fill = class_name == "NRP")) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c("white", "red"),
+                    labels = c("Other", "NRP"),
+                    name = "Class Highlight") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", color = "black", linewidth = 1)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Highlighting NRP in BGC Chemical Class Distribution",
+    x = "Location",
+    y = "Percent"
+  )
+```
+```{r}
+ggplot(class_summary,
+       aes(x = Dataset, y = count,
+           fill = class_name == "Polyketide")) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c("white", "red"),
+                    labels = c("Other", "Polyketide"),
+                    name = "Class Highlight") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(yintercept = 0.15, linetype = "dashed", color = "black", linewidth = 1) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Highlighting PKS in BGC Chemical Class Distribution",
+    x = "Location",
+    y = "Percent"
+  )
+```
+
+
+```{r}
+ggplot(class_summary,
+       aes(x = Dataset, y = count,
+           fill = class_name == "RiPP")) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c("white", "red"),
+                    labels = c("Other", "RiPP"),
+                    name = "Class Highlight") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", color = "black", linewidth = 1) +
+  labs(
+    title = "Highlighting RiPPs in BGC Chemical Class Distribution",
+    x = "Location",
+    y = "Percent"
+  )
+```
+
+```{r}
+ggplot(class_summary,
+       aes(x = Dataset, y = count,
+           fill = class_name == "Other")) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c("white", "red"),
+                    labels = c("Other Classes", "Others"),
+                    name = "Class Highlight") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", color = "black", linewidth = 1)+
+  labs(
+    title = "Highlighting Others in BGC Chemical Class Distribution",
+    x = "Location",
+    y = "Percent"
+  )
+```
+
+```{r}
+nrps_df <- df %>%
+  filter(class_name == "NRP")
+
+# 3. Count subclasses of "NRPS" by Dataset
+nrps_summary <- nrps_df %>%
+  group_by(Dataset, subclass_name) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  arrange(Dataset, desc(count))
+
+ggplot(nrps_summary,
+       aes(x = Dataset, y = count, fill = subclass_name)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(option = "turbo") +  # vivid, well-separated colors
+  labs(title = "Proportion of 'NRPS' subclasses by location",
+       x = "Location", y = "Percent", fill = "Subclass") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+```
+
+
+```{r}
+pks_df <- df %>%
+  filter(class_name == "Polyketide")
+
+# 3. Count subclasses of "NRPS" by Dataset
+pks_summary <- pks_df %>%
+  group_by(Dataset, subclass_name) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  arrange(Dataset, desc(count))
+
+ggplot(pks_summary,
+       aes(x = Dataset, y = count, fill = subclass_name)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(option = "turbo") +  # vivid, well-separated colors
+  labs(title = "Proportion of 'PKS' subclasses by location",
+       x = "Location", y = "Percent", fill = "Subclass") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+```
+
+```{r}
+ripp_df <- df %>%
+  filter(class_name == "RiPP")
+
+# 3. Count subclasses of "NRPS" by Dataset
+ripp_summary <- ripp_df %>%
+  group_by(Dataset, subclass_name) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  arrange(Dataset, desc(count))
+
+ggplot(ripp_summary,
+       aes(x = Dataset, y = count, fill = subclass_name)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(option = "turbo") +  # vivid, well-separated colors
+  labs(title = "Proportion of 'RiPP' subclasses by location",
+       x = "Location", y = "Percent", fill = "Subclass") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+```{r}
+other_df <- df %>%
+  filter(class_name == "Other")
+
+# 3. Count subclasses of "NRPS" by Dataset
+other_summary <- other_df %>%
+  group_by(Dataset, subclass_name) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  arrange(Dataset, desc(count))
+
+ggplot(other_summary,
+       aes(x = Dataset, y = count, fill = subclass_name)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_viridis_d(option = "turbo") +  # vivid, well-separated colors
+  labs(title = "Proportion of 'Other' subclasses by location",
+       x = "Location", y = "Percent", fill = "Subclass") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+nrps_subclass_PA <- nrps_summary %>%
+  mutate(present = count > 0) %>%        # convert counts to TRUE/FALSE
+  group_by(subclass_name) %>%
+  summarise(datasets_present = sum(present)) %>%
+  arrange(desc(datasets_present))
+
+nrps_subclass_PA
+
+```
+
+```{r}
+pks_subclass_PA <- pks_summary %>%
+  mutate(present = count > 0) %>%        # convert counts to TRUE/FALSE
+  group_by(subclass_name) %>%
+  summarise(datasets_present = sum(present)) %>%
+  arrange(desc(datasets_present))
+
+pks_subclass_PA
+
+```
+
+```{r}
+ripp_subclass_PA <- ripp_summary %>%
+  mutate(present = count > 0) %>%        # convert counts to TRUE/FALSE
+  group_by(subclass_name) %>%
+  summarise(datasets_present = sum(present)) %>%
+  arrange(desc(datasets_present))
+
+ripp_subclass_PA
+
+```
+
+```{r}
+other_subclass_PA <- other_summary %>%
+  mutate(present = count > 0) %>%        # convert counts to TRUE/FALSE
+  group_by(subclass_name) %>%
+  summarise(datasets_present = sum(present)) %>%
+  arrange(desc(datasets_present))
+
+other_subclass_PA
+
+```
+
+
+```{r}
+# 2. Total number of samples per location
+total_counts <- sidephore_df %>%
+  group_by(location) %>%
+  summarise(total_samples = n(), .groups = "drop")
+
+phos_df <- comm_subclass_df %>%
+  select(file, phosphonate, `phosphonate-like`) %>%
+  mutate(
+    has_phosphonate = phosphonate > 0,
+    has_phosphonate_like = `phosphonate-like` > 0,
+    any_phos = has_phosphonate | has_phosphonate_like
+  )
+phos_df$location = sample_meta$location
+phos_df$broad_env = sample_meta$broad_env
+phos_samples <- phos_df %>% filter(any_phos == TRUE)
+
+phos_counts <- phos_df %>%
+  filter(any_phos == TRUE) %>%
+  group_by(location) %>%
+  summarise(n_phos_samples = n())
+
+
+phos_samples <- phos_samples %>%
+  mutate(phos_total = phosphonate + `phosphonate-like`)
+phos_samples <- phos_samples %>%
+  left_join(phos_counts, by = "location") %>%
+  left_join(total_counts,      by = "location") %>%
+  mutate(label = paste0(location, " (", n_phos_samples,  "/", total_samples, ")"))
+
+
+ggplot(phos_samples, aes(x = label, y = phos_total, fill = broad_env)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Phosphonate-type BGC Counts per Sample",
+    x = "Environment (phosphonate-positive sample count)",
+    y = "Total phosphonate-like BGCs"
+  )
+
+```
+
+```{r}
+subset_phos <- df %>% 
+  filter(subclass_name %in% c("phosphonate", "phosphonate-like")) %>%
+  select(file, Dataset, gcf_id)
+
+
+edge_df <- subset_phos %>%
+  select(file, gcf_id) %>%
+  inner_join(., ., by = "gcf_id") %>%   # all pairs sharing the same gcf_id
+  filter(file.x < file.y) %>%           # avoid duplicates & self-pairs
+  transmute(from = file.x, to = file.y) %>%
+  distinct()
+
+# Node table: one row per sample
+node_df <- subset_phos %>%
+  select(file, Dataset) %>%
+  distinct() %>%
+  rename(name = file)
+
+# 1. Make graph using only edges
+g <- graph_from_data_frame(edge_df, directed = FALSE)
+
+# 2. Add Dataset as a vertex attribute
+V(g)$Dataset <- node_df$Dataset[match(V(g)$name, node_df$name)]
+
+# Plot
+ggraph(g, layout = "fr") +
+  geom_edge_link(alpha = 0.3, colour = "grey60") +
+  geom_node_point(aes(color = Dataset), size = 4) +
+  theme_void() +
+  labs(
+    title    = "Phosphonate GCF Network",
+    subtitle = "Nodes = samples, edges = shared GCF IDs",
+    color    = "Dataset"
+  )
+
+```
+
+```{r}
+# 1. Subset and flag siderophore-positive samples
+sidephore_df <- comm_subclass_df %>%
+  select(file, siderophore) %>%                 # <-- column name likely "siderophore"
+  mutate(
+    has_siderophore = siderophore > 0,
+    location  = sample_meta$location,
+    broad_env = sample_meta$broad_env
+  )
+
+# 2. Keep only samples that have >=1 siderophore BGC
+sidephore_samples <- sidephore_df %>%
+  filter(has_siderophore)
+
+# 3. Count siderophore-positive samples per dataset (location)
+sidephore_counts <- sidephore_samples %>%
+  group_by(location) %>%
+  summarise(
+    n_siderophore_samples = n(),
+    .groups = "drop"
+  )
+
+# 4. Add "location (count)" label for plotting
+sidephore_samples <- sidephore_samples %>%
+  left_join(sidephore_counts, by = "location") %>%
+  left_join(total_counts,      by = "location") %>%
+  mutate(label = paste0(location, " (", n_siderophore_samples, "/", total_samples, ")"))
+
+# 5. Plot
+ggplot(sidephore_samples,
+       aes(x = label, y = siderophore, fill = broad_env)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Siderophore BGC Counts per Sample",
+    x = "Environment (siderophore-positive sample count)",
+    y = "Total siderophore BGCs per sample"
+  )
+
+```
+
+```{r}
+subset_sidephore <- df %>% 
+  filter(subclass_name %in% c("siderophore")) %>%
+  select(file, Dataset, gcf_id)
+
+
+edge_df <- subset_sidephore %>%
+  select(file, gcf_id) %>%
+  inner_join(., ., by = "gcf_id") %>%   # all pairs sharing the same gcf_id
+  filter(file.x < file.y) %>%           # avoid duplicates & self-pairs
+  transmute(from = file.x, to = file.y) %>%
+  distinct()
+
+# Node table: one row per sample
+node_df <- subset_sidephore %>%
+  select(file, Dataset) %>%
+  distinct() %>%
+  rename(name = file)
+
+# 1. Make graph using only edges
+g <- graph_from_data_frame(edge_df, directed = FALSE)
+
+# 2. Add Dataset as a vertex attribute
+V(g)$Dataset <- node_df$Dataset[match(V(g)$name, node_df$name)]
+
+# Plot
+ggraph(g, layout = "fr") +
+  geom_edge_link(alpha = 0.3, colour = "grey60") +
+  geom_node_point(aes(color = Dataset), size = 4) +
+  theme_void() +
+  labs(
+    title    = "Siderophore GCF Network",
+    subtitle = "Nodes = samples, edges = shared GCF IDs",
+    color    = "Dataset"
+  )
+
+```
+
+
+```{r echo=FALSE}
+#Dim Reduction plot for total Samples
+set.seed(0)
+# Use the aligned community matrix
+df.data <- as.data.frame(comm_subclass)
+
+# Metadata
+Sample_Type  <- sample_meta$location
+Sample_Names <- sample_meta$sample
+
+# UMAP (uwot::umap returns a matrix)
+df.umap <- umap(df.data, n_components = 2)
+
+# Convert result to data.frame
+df_out <- as.data.frame(df.umap)
+colnames(df_out) <- c("UMAP1", "UMAP2")
+df_out$Sample_Type  <- Sample_Type
+df_out$Sample_Names <- Sample_Names
+
+# Plot
+ggplot(df_out, aes(x = UMAP1, y = UMAP2, color = Sample_Type)) +
+  geom_point(size = 1.5) +
+  # if you have a custom palette:
+  # scale_color_manual(values = color_multi) +
+  stat_conf_ellipse(level = 0.9999) +
+  ggtitle("BGC subclass diversity vs location")
+
+```
+
+```{r}
+# Remove metasub from metadata
+sample_meta_filt <- sample_meta %>%
+  filter(location != "metasub")
+# Subset community matrix to filtered samples
+comm_subclass_filt <- comm_subclass[sample_meta_filt$sample, , drop = FALSE]
+
+set.seed(0)
+
+df.data <- as.data.frame(comm_subclass_filt)
+
+Sample_Type  <- sample_meta_filt$location
+Sample_Names <- sample_meta_filt$sample
+
+df.umap <- umap(df.data, n_components = 2)
+
+df_out <- as.data.frame(df.umap)
+colnames(df_out) <- c("UMAP1", "UMAP2")
+df_out$Sample_Type  <- Sample_Type
+df_out$Sample_Names <- Sample_Names
+
+g <- ggplot(df_out, aes(UMAP1, UMAP2, color = Sample_Type)) +
+  geom_point(size = 1.5) +
+  stat_conf_ellipse(level = 0.9999) +
+  ggtitle("BGC subclass diversity vs location (no metasub)")
+
+g
+
+```
+
+```{r}
+#Calculating alpha diversity class
+sample_meta$alpha_simpson_class <-  diversity(comm_class_df[, -1], index = "simpson")
+sample_meta$alpha_shannon_class <-  diversity(comm_class_df[, -1], index = "shannon")
+sample_meta$alpha_invsimpson_class <- diversity(comm_class_df[, -1], index = "invsimpson")
+sample_meta$richness_class <- specnumber(comm_class_df[, -1])
+
+#Calculating alpha diversity subclass
+sample_meta$alpha_simpson_subclass <-  diversity(comm_subclass_df[, -1], index = "simpson")
+sample_meta$alpha_shannon_subclass <-  diversity(comm_subclass_df[, -1], index = "shannon")
+sample_meta$alpha_invsimpson_subclass <- diversity(comm_subclass_df[, -1], index = "invsimpson")
+sample_meta$richness_subclass <- specnumber(comm_subclass_df[, -1])
+
+#Calculating alpha diversity gcf
+sample_meta$alpha_simpson_gcf <-  diversity(comm_gcf_df[, -1], index = "simpson")
+sample_meta$alpha_shannon_gcf <-  diversity(comm_gcf_df[, -1], index = "shannon")
+sample_meta$alpha_invsimpson_gcf <- diversity(comm_gcf_df[, -1], index = "invsimpson")
+sample_meta$richness_gcf <- specnumber(comm_gcf_df[, -1])
+
+```
+
+```{r}
+run_pairwise_mw <- function(data, value_col, group_col, p_cutoff = 0.05) {
+  # Lazily evaluate column names
+  value <- data[[value_col]]
+  group <- data[[group_col]]
+  
+  # Step 1: Run pairwise Wilcoxon tests
+  mw_res <- pairwise.wilcox.test(
+    x = value,
+    g = group,
+    p.adjust.method = "BH"
+  )
+  
+  # Step 2: Convert matrix to tidy tibble
+  tidy_res <- as.data.frame(as.table(mw_res$p.value)) %>%
+    filter(!is.na(Freq)) %>%
+    rename(
+      group1  = Var1,
+      group2  = Var2,
+      p_value = Freq
+    ) %>%
+    mutate(
+      p_adj    = p_value,
+      label    = paste0("p=", signif(p_adj, 3)),
+      sig_star = case_when(
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01  ~ "**",
+        p_adj < 0.05  ~ "*",
+        TRUE          ~ "ns"
+      )
+    ) %>%
+    filter(p_adj < p_cutoff)  # keep only significant pairs
+  
+  return(tidy_res)
+}
+```
+
+
+
+
+```{r}
+mw_simpson_class <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_simpson_class",
+  group_col = "location"
+)
+
+ggplot(mw_simpson_class, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+```{r}
+# compute medians per location
+med_df <- sample_meta %>%
+  group_by(location) %>%
+  summarise(med = median(alpha_simpson_class, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = location, y = alpha_simpson_class, fill = location)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = location, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Gini-Simpson Diversity of BGC Chemical classes",
+    x = "Location",
+    y = "Simpson Diversity Index"
+  )
+
+```
+
+
+```{r}
+# compute medians per broad_env
+med_df <- sample_meta %>%
+  group_by(broad_env) %>%
+  summarise(med = median(alpha_simpson_class, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = broad_env, y = alpha_simpson_class, fill = broad_env)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = broad_env, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Gini-Simpson Diversity of BGC Chemical classes",
+    x = "Environment",
+    y = "Simpson Diversity Index"
+  )
+
+```
+
+
+```{r}
+mw_simpson_class <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_simpson_class",
+  group_col = "broad_env"
+)
+
+ggplot(mw_simpson_class, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+```{r}
+sub_sample <- sample_meta[sample_meta$sample %in% comm_genus_df$file, ]
+
+#Calculating alpha diversity Genus
+sub_sample$alpha_simpson_genus <-  diversity(comm_genus_df[, -1], index = "simpson")
+sub_sample$alpha_shannon_genus <-  diversity(comm_genus_df[, -1], index = "shannon")
+sub_sample$alpha_invsimpson_genus <- diversity(comm_genus_df[, -1], index = "invsimpson")
+sub_sample$richness_genus <- specnumber(comm_genus_df[, -1])
+```
+
+
+```{r}
+model <- lm(alpha_simpson_genus ~ alpha_simpson_class, data = sub_sample)
+
+eq <- paste0(
+  "y = ", round(coef(model)[2], 3), "x + ", round(coef(model)[1], 3),
+  "\nR² = ", round(summary(model)$r.squared, 3)
+)
+
+ggplot(sub_sample, aes(x = alpha_simpson_class, 
+                       y = alpha_simpson_genus,
+                       color = broad_env)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm",
+              se = TRUE,
+              color = "red",
+              linewidth = 1) +
+  annotate("text",
+           x = Inf, y = -Inf,        # bottom-right corner
+           hjust = 1.1, vjust = -0.5,
+           label = eq,
+           size = 5) +
+  theme_minimal() +
+  labs(
+    title = "Relationship between BGC Class and Genus Gini-Simpson Diversity",
+    x = "BGC Class Gini-Simpson Index",
+    y = "Genus Gini-Simpson Index",
+    color = "Environment"
+  )
+```
+
+
+```{r}
+mw_shannon_subclass <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_shannon_subclass",
+  group_col = "location"
+)
+
+ggplot(mw_shannon_subclass, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+```{r}
+# compute medians per location
+med_df <- sample_meta %>%
+  group_by(location) %>%
+  summarise(med = median(alpha_shannon_subclass, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = location, y = alpha_shannon_subclass, fill = location)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = location, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Shannon Diversity of BGC Chemical subclasses",
+    x = "Location",
+    y = "Shannon Diversity"
+  )
+
+```
+
+```{r}
+# compute medians per environment
+med_df <- sample_meta %>%
+  group_by(broad_env) %>%
+  summarise(med = median(alpha_shannon_subclass, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = broad_env, y = alpha_shannon_subclass, fill = broad_env)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = broad_env, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Shannon Diversity of BGC Chemical subclasses",
+    x = "Location",
+    y = "Shannon Diversity"
+  )
+
+```
+
+```{r}
+mw_shannon_subclass <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_shannon_subclass",
+  group_col = "broad_env"
+)
+
+ggplot(mw_shannon_subclass, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+```{r}
+model <- lm(alpha_shannon_genus ~ alpha_shannon_subclass, data = sub_sample)
+
+eq <- paste0(
+  "y = ", round(coef(model)[2], 3), "x + ", round(coef(model)[1], 3),
+  "\nR² = ", round(summary(model)$r.squared, 3)
+)
+
+ggplot(sub_sample, aes(x = alpha_shannon_subclass, 
+                       y = alpha_shannon_genus,
+                       color = broad_env)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm",
+              se = TRUE,
+              color = "red",
+              linewidth = 1) +
+  annotate("text",
+           x = Inf, y = -Inf,        # bottom-right corner
+           hjust = 1.1, vjust = -0.5,
+           label = eq,
+           size = 5) +
+  theme_minimal() +
+  labs(
+    title = "Relationship between BGC sublass and Shannon Diversity",
+    x = "BGC Shannon Diversity",
+    y = "Genus Shannon Diversity",
+    color = "Environment"
+  )
+```
+
+
+```{r}
+model <- lm(alpha_shannon_genus ~ alpha_shannon_class, data = sub_sample)
+
+eq <- paste0(
+  "y = ", round(coef(model)[2], 3), "x + ", round(coef(model)[1], 3),
+  "\nR² = ", round(summary(model)$r.squared, 3)
+)
+
+ggplot(sub_sample, aes(x = alpha_shannon_class, 
+                       y = alpha_shannon_genus,
+                       color = broad_env)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm",
+              se = TRUE,
+              color = "red",
+              linewidth = 1) +
+  annotate("text",
+           x = Inf, y = -Inf,        # bottom-right corner
+           hjust = 1.1, vjust = -0.5,
+           label = eq,
+           size = 5) +
+  theme_minimal() +
+  labs(
+    title = "Relationship between BGC class and Shannon Diversity",
+    x = "BGC Shannon Diversity",
+    y = "Genus Shannon Diversity",
+    color = "Environment"
+  )
+```
+
+
+
+```{r}
+# compute medians per environment
+med_df <- sample_meta %>%
+  group_by(location) %>%
+  summarise(med = median(richness_gcf, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = location, y = richness_gcf, fill = location)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = location, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Richness of BGC GCF",
+    x = "Location",
+    y = "Richness"
+  )
+
+```
+
+
+```{r}
+mw_richness_gcf <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "richness_gcf",
+  group_col = "location"
+)
+
+ggplot(mw_richness_gcf, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+
+```{r}
+# compute medians per environment
+med_df <- sample_meta %>%
+  group_by(location) %>%
+  summarise(med = median(alpha_shannon_gcf, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = location, y = alpha_shannon_gcf, fill = location)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = location, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Shannon Diversity of BGC GCF",
+    x = "Location",
+    y = "Shannon Diversity"
+  )
+
+```
+```{r}
+mw_shannon_gcf <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_shannon_gcf",
+  group_col = "location"
+)
+
+ggplot(mw_shannon_gcf, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+
+```{r}
+# compute medians per environment
+med_df <- sample_meta %>%
+  group_by(location) %>%
+  summarise(med = median(alpha_simpson_gcf, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = location, y = alpha_simpson_gcf, fill = location)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = location, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Simpson Diversity of BGC GCF",
+    x = "Location",
+    y = "Simpson Diversity"
+  )
+
+```
+
+
+```{r}
+mw_simpson_gcf <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_simpson_gcf",
+  group_col = "location"
+)
+
+ggplot(mw_simpson_gcf, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+```{r}
+# compute medians per environment
+med_df <- sample_meta %>%
+  group_by(broad_env) %>%
+  summarise(med = median(richness_gcf, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = broad_env, y = richness_gcf, fill = broad_env)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = broad_env, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Richness of BGC GCF",
+    x = "Environment",
+    y = "Richness"
+  )
+
+```
+
+
+
+```{r}
+# compute medians per environment
+med_df <- sample_meta %>%
+  group_by(broad_env) %>%
+  summarise(med = median(alpha_shannon_gcf, na.rm = TRUE))
+
+ggplot(sample_meta, aes(x = broad_env, y = alpha_shannon_gcf, fill = broad_env)) +
+  geom_boxplot(outlier.size = 2, outlier.alpha = 0.8) +
+  geom_text(data = med_df,
+            aes(x = broad_env, y = med, label = round(med, 2)),
+            vjust = -0.7, size = 3.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Alpha Shannon of BGC GCF",
+    x = "Environment",
+    y = "Shannon Diversity"
+  )
+
+```
+
+```{r}
+mw_simpson_gcf <- run_pairwise_mw(
+  data = sample_meta,
+  value_col = "alpha_shannon_gcf",
+  group_col = "broad_env"
+)
+
+ggplot(mw_simpson_gcf, aes(x = group1, y = group2, fill = p_adj)) +
+  geom_raster() +
+  geom_tile(color = "black", linewidth = 0.3) +        # 🔳 add boxes
+  geom_text(aes(label = sig_star), size = 3) +
+  scale_fill_distiller(palette = "Spectral", direction = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # 🔥 45°         # 🔥 optional tilt for y-axis
+    axis.title.x = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    x = "group1",
+    y = "group2",
+    title = "Pairwise Mann-Whitney Significance"
+  )
+
+```
+
+```{r}
+model <- lm(alpha_shannon_genus ~ alpha_shannon_gcf, data = sub_sample)
+
+eq <- paste0(
+  "y = ", round(coef(model)[2], 3), "x + ", round(coef(model)[1], 3),
+  "\nR² = ", round(summary(model)$r.squared, 3)
+)
+
+ggplot(sub_sample, aes(x = alpha_shannon_gcf, 
+                       y = alpha_shannon_genus,
+                       color = broad_env)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm",
+              se = TRUE,
+              color = "red",
+              linewidth = 1) +
+  annotate("text",
+           x = Inf, y = -Inf,        # bottom-right corner
+           hjust = 1.1, vjust = -0.5,
+           label = eq,
+           size = 5) +
+  theme_minimal() +
+  labs(
+    title = "Relationship between GCFs and Shannon Diversity",
+    x = "GCF Shannon Diversity",
+    y = "Genus Shannon Diversity",
+    color = "Environment"
+  )
+```
+
+
+```{r}
+#Beta diversity
+beta_dist_class <- vegdist(comm_class_df[, -1], index = "bray")
+mds_class <- metaMDS(beta_dist_class)
+
+beta_dist_subclass <- vegdist(comm_subclass_df[, -1], index = "bray")
+mds_class <- metaMDS(beta_dist_subclass)
+
+beta_dist_gcf <- vegdist(comm_gcf_df[, -1], index = "bray")
+mds_class <- metaMDS(beta_dist_gcf)
+```
+
+```{r}
+mds_data <- as.data.frame(mds_class$points) %>%
+  dplyr::mutate(sample = comm_class_df$file) %>%   # add sample IDs
+  dplyr::left_join(
+    sample_meta %>% dplyr::select(sample, location, broad_env),
+    by = "sample"
+  )
+
+ggplot(mds_data, aes(x = MDS1, y = MDS2, color = location)) +
+  geom_point(size = 2, alpha = 0.8) +
+  stat_conf_ellipse(level = 0.95) +   # 95% ellipses are usually more sensible than 99.99%
+  theme_minimal() +
+  labs(
+    title = "Bray–Curtis Beta Diversity (BGC class)",
+    x = "NMDS1",
+    y = "NMDS2",
+    color = "Location"
+  ) 
+```
+
+
+```{r}
+perm <- adonis2(beta_dist_class ~ broad_env, data = sample_meta, permutations = 999)
+bd <- betadisper(beta_dist_class, sample_meta$broad_env)
+anova(bd)                 # test significance
+TukeyHSD(bd)              # which groups differ
+```
+
+
+```{r}
+# Panel A: Boxplot with key comparisons
+disp_df <- data.frame(
+  environment = sample_meta$broad_env,
+  dispersion = bd$distances
+)
+
+ggplot(disp_df, aes(x = reorder(environment, dispersion, median), 
+                          y = dispersion, fill = environment)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.8, alpha = 0.3) +
+  
+  # Highlight sludge (lowest dispersion)
+  geom_hline(yintercept = median(disp_df$dispersion[disp_df$environment == "sludge"]),
+             linetype = "dashed", color = "red", linewidth = 1) +
+  
+  annotate("text", x = 1, y = max(disp_df$dispersion) * 0.95,
+           label = "Sludge: most homogeneous\n(lowest dispersion)",
+           hjust = 0, size = 4, color = "red", fontface = "bold") +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14)
+  ) +
+  labs(
+    title = "A. Dispersion by Environment",
+    x = "Environment (ordered by median dispersion)",
+    y = "Distance to Centroid"
+  ) +
+  scale_fill_viridis_d(option = "turbo")
+
+```
+
+```{r}
+# Panel B: Significant pairwise comparisons
+tukey_df <- as.data.frame(TukeyHSD(bd)$group)
+tukey_df$comparison <- rownames(tukey_df)
+
+sig_comparisons <- tukey_df %>%
+  filter(`p adj` < 0.05) %>%
+  arrange(`p adj`) %>%
+  head(10) %>%  # Top 10 most significant
+  mutate(
+    comparison = factor(comparison, levels = comparison),
+    sig_level = case_when(
+      `p adj` < 0.001 ~ "p < 0.001",
+      `p adj` < 0.01  ~ "p < 0.01",
+      TRUE            ~ "p < 0.05"
+    )
+  )
+
+ggplot(sig_comparisons, aes(x = diff, y = reorder(comparison, diff), 
+                                  color = sig_level)) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = lwr, xmax = upr), height = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "B. Top 10 Significant Pairwise Differences",
+    x = "Difference in Dispersion (95% CI)",
+    y = "Comparison",
+    color = "Significance"
+  ) +
+  scale_color_manual(values = c("p < 0.001" = "firebrick",
+                                 "p < 0.01" = "orange",
+                                 "p < 0.05" = "steelblue"))
+```
+
+
+```{r}
+perm <- adonis2(beta_dist_class ~ location, data = sample_meta, permutations = 999)
+bd <- betadisper(beta_dist_class, sample_meta$location)
+anova(bd)                 # test significance
+TukeyHSD(bd)              # which groups differ
+```
+
+
+```{r}
+# Panel B: Significant pairwise comparisons
+tukey_df <- as.data.frame(TukeyHSD(bd)$group)
+tukey_df$comparison <- rownames(tukey_df)
+
+sig_comparisons <- tukey_df %>%
+  filter(`p adj` < 0.05) %>%
+  arrange(`p adj`) %>%
+  head(10) %>%  # Top 10 most significant
+  mutate(
+    comparison = factor(comparison, levels = comparison),
+    sig_level = case_when(
+      `p adj` < 0.001 ~ "p < 0.001",
+      `p adj` < 0.01  ~ "p < 0.01",
+      TRUE            ~ "p < 0.05"
+    )
+  )
+
+ggplot(sig_comparisons, aes(x = diff, y = reorder(comparison, diff), 
+                                  color = sig_level)) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = lwr, xmax = upr), height = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "B. Top 10 Significant Pairwise Differences",
+    x = "Difference in Dispersion (95% CI)",
+    y = "Comparison",
+    color = "Significance"
+  ) +
+  scale_color_manual(values = c("p < 0.001" = "firebrick",
+                                 "p < 0.01" = "orange",
+                                 "p < 0.05" = "steelblue"))
+```
+
+
+```{r}
+perm <- adonis2(beta_dist_subclass ~ location, data = sample_meta, permutations = 999)
+bd <- betadisper(beta_dist_subclass, sample_meta$location)
+anova(bd)                 # test significance
+TukeyHSD(bd)              # which groups differ
+```
+
+
+```{r}
+# Panel B: Significant pairwise comparisons
+tukey_df <- as.data.frame(TukeyHSD(bd)$group)
+tukey_df$comparison <- rownames(tukey_df)
+
+sig_comparisons <- tukey_df %>%
+  filter(`p adj` < 0.05) %>%
+  arrange(`p adj`) %>%
+  head(10) %>%  # Top 10 most significant
+  mutate(
+    comparison = factor(comparison, levels = comparison),
+    sig_level = case_when(
+      `p adj` < 0.001 ~ "p < 0.001",
+      `p adj` < 0.01  ~ "p < 0.01",
+      TRUE            ~ "p < 0.05"
+    )
+  )
+
+ggplot(sig_comparisons, aes(x = diff, y = reorder(comparison, diff), 
+                                  color = sig_level)) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = lwr, xmax = upr), height = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "B. Top 10 Significant Pairwise Differences",
+    x = "Difference in Dispersion (95% CI)",
+    y = "Comparison",
+    color = "Significance"
+  ) +
+  scale_color_manual(values = c("p < 0.001" = "firebrick",
+                                 "p < 0.01" = "orange",
+                                 "p < 0.05" = "steelblue"))
+```
+
+```{r}
+perm <- adonis2(beta_dist_subclass ~ broad_env, data = sample_meta, permutations = 999)
+bd <- betadisper(beta_dist_subclass, sample_meta$broad_env)
+anova(bd)                 # test significance
+TukeyHSD(bd)              # which groups differ
+```
+
+
+```{r}
+# Panel B: Significant pairwise comparisons
+tukey_df <- as.data.frame(TukeyHSD(bd)$group)
+tukey_df$comparison <- rownames(tukey_df)
+
+sig_comparisons <- tukey_df %>%
+  filter(`p adj` < 0.05) %>%
+  arrange(`p adj`) %>%
+  head(10) %>%  # Top 10 most significant
+  mutate(
+    comparison = factor(comparison, levels = comparison),
+    sig_level = case_when(
+      `p adj` < 0.001 ~ "p < 0.001",
+      `p adj` < 0.01  ~ "p < 0.01",
+      TRUE            ~ "p < 0.05"
+    )
+  )
+
+ggplot(sig_comparisons, aes(x = diff, y = reorder(comparison, diff), 
+                                  color = sig_level)) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = lwr, xmax = upr), height = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "B. Top 10 Significant Pairwise Differences",
+    x = "Difference in Dispersion (95% CI)",
+    y = "Comparison",
+    color = "Significance"
+  ) +
+  scale_color_manual(values = c("p < 0.001" = "firebrick",
+                                 "p < 0.01" = "orange",
+                                 "p < 0.05" = "steelblue"))
+```
+
+
+```{r}
+perm <- adonis2(beta_dist_gcf ~ broad_env, data = sample_meta, permutations = 999)
+bd <- betadisper(beta_dist_gcf, sample_meta$broad_env)
+anova(bd)                 # test significance
+TukeyHSD(bd)              # which groups differ
+```
+
+
+```{r}
+# Panel B: Significant pairwise comparisons
+tukey_df <- as.data.frame(TukeyHSD(bd)$group)
+tukey_df$comparison <- rownames(tukey_df)
+
+sig_comparisons <- tukey_df %>%
+  filter(`p adj` < 0.05) %>%
+  arrange(`p adj`) %>%
+  head(10) %>%  # Top 10 most significant
+  mutate(
+    comparison = factor(comparison, levels = comparison),
+    sig_level = case_when(
+      `p adj` < 0.001 ~ "p < 0.001",
+      `p adj` < 0.01  ~ "p < 0.01",
+      TRUE            ~ "p < 0.05"
+    )
+  )
+
+ggplot(sig_comparisons, aes(x = diff, y = reorder(comparison, diff), 
+                                  color = sig_level)) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = lwr, xmax = upr), height = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "B. Top 10 Significant Pairwise Differences",
+    x = "Difference in Dispersion (95% CI)",
+    y = "Comparison",
+    color = "Significance"
+  ) +
+  scale_color_manual(values = c("p < 0.001" = "firebrick",
+                                 "p < 0.01" = "orange",
+                                 "p < 0.05" = "steelblue"))
+```
+
+```{r}
+perm <- adonis2(beta_dist_gcf ~ location, data = sample_meta, permutations = 999)
+bd <- betadisper(beta_dist_gcf, sample_meta$location)
+anova(bd)                 # test significance
+TukeyHSD(bd)              # which groups differ
+```
+
+
+```{r}
+# Panel B: Significant pairwise comparisons
+tukey_df <- as.data.frame(TukeyHSD(bd)$group)
+tukey_df$comparison <- rownames(tukey_df)
+
+sig_comparisons <- tukey_df %>%
+  filter(`p adj` < 0.05) %>%
+  arrange(`p adj`) %>%
+  head(10) %>%  # Top 10 most significant
+  mutate(
+    comparison = factor(comparison, levels = comparison),
+    sig_level = case_when(
+      `p adj` < 0.001 ~ "p < 0.001",
+      `p adj` < 0.01  ~ "p < 0.01",
+      TRUE            ~ "p < 0.05"
+    )
+  )
+
+ggplot(sig_comparisons, aes(x = diff, y = reorder(comparison, diff), 
+                                  color = sig_level)) +
+  geom_point(size = 4) +
+  geom_errorbarh(aes(xmin = lwr, xmax = upr), height = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "B. Top 10 Significant Pairwise Differences",
+    x = "Difference in Dispersion (95% CI)",
+    y = "Comparison",
+    color = "Significance"
+  ) +
+  scale_color_manual(values = c("p < 0.001" = "firebrick",
+                                 "p < 0.01" = "orange",
+                                 "p < 0.05" = "steelblue"))
+```
