@@ -59,3 +59,9 @@ for t in $(sqlite3 result/data.db "SELECT name FROM sqlite_master WHERE type='ta
 done
 
 ```
+
+
+To convert gtdbtk -> taxa for antismash the gtdbtk, go to krumsiek lab server and run 
+```
+python make_bigslice_taxonomy2.py tara
+```
