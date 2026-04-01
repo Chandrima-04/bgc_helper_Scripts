@@ -65,3 +65,9 @@ To convert gtdbtk -> taxa for antismash the gtdbtk, go to krumsiek lab server an
 ```
 python make_bigslice_taxonomy2.py tara
 ```
+
+Also, to arrange the bins, ie sample name + taxa 
+```
+python organize_bgcs_by_bin.py antarctica_thompson
+```
+Both are run from bgc_data
