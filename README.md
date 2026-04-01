@@ -71,3 +71,11 @@ Also, to arrange the bins, ie sample name + taxa
 python organize_bgcs_by_bin.py antarctica_thompson
 ```
 Both are run from bgc_data
+
+Running bigslice:
+```
+docker1 run --rm \
+  -v /workdir/cb846/bgc_data:/data \
+  biohpc_cb846/bigslice-local \
+  bigslice -i /data/bigslice_input /data/bigslice_out_apr1
+```
