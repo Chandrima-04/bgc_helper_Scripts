@@ -60,6 +60,17 @@ done
 
 ```
 
+You need Antismash names too. In masonlab server, antismash folder of each dataset do this 
+```
+find . -type f -name "*.region*.gbk" | \
+awk -F'/' '{
+  file=$(NF)
+  gca=$(NF-1)
+  sub(/\.region.*/, "", file)
+  print file "\t" gca
+}' > node_to_gca.txt
+```
+
 
 To convert gtdbtk -> taxa for antismash the gtdbtk, go to krumsiek lab server and run 
 ```
