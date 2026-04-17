@@ -90,3 +90,12 @@ docker1 run --rm \
   biohpc_cb846/bigslice-local \
   bigslice -i /data/bigslice_input /data/bigslice_out_apr1
 ```
+
+Getting csv from BGCs:
+```
+mkdir -p csv
+
+for table in $(sqlite3 result/data.db ".tables"); do
+    sqlite3 -header -csv result/data.db "SELECT * FROM $table;" > csv/${table}.csv
+done
+```
