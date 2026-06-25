@@ -87,7 +87,7 @@ Running bigslice:
 ```
 docker1 run --rm \
   -v /workdir/cb846/bgc_data:/data \
-  biohpc_cb846/bigslice-local \
+  biohpc_cb846/bigslice-v2 \
   bigslice -i /data/bigslice_input /data/bigslice_out_apr1
 ```
 
