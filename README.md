@@ -91,6 +91,19 @@ docker1 run --rm \
   bigslice -i /data/bigslice_input /data/bigslice_out_apr1
 ```
 
+Running mibig on bigslice - you run it on a folder which already have bgcs done in this mode. if you want to otherwise, add mibig to run, then dont run this seperately. This is some query mode!!!!:
+```
+docker1 run --rm \
+  -v /workdir/cb846/bgc_data:/data \
+  biohpc_cb846/bigslice-v3 \
+  bigslice \
+  -t 112 \
+  --query /data/bigslice_input/gbk_file/mibig4_bigslice \
+  --query_name mibig4_v2 \
+  --n_ranks 10 \
+  /data/bigslice_out_sep10_v4_mibig4
+```
+
 Getting csv from BGCs:
 ```
 mkdir -p csv
